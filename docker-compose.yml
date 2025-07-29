@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  # Base de données PostgreSQL avec PostGIS
+  postgres:
+    image: postgis/postgis:14-3.2
+    container_name: rfd_postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-registre_foncier}
+      POSTGRES_USER: ${DB_USER:-rfd_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-rfd_password}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - rfd_network
+
+  # Cache Redis
+  redis:
+    image: redis:7-alpine
+    container_name: rfd_redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - rfd_network
+
+  # Backend API FastAPI
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rfd_backend
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-rfd_user}:${DB_PASSWORD:-rfd_password}@postgres:5432/${DB_NAME:-registre_foncier}
+      - REDIS_URL=redis://redis:6379
+      - CELO_NETWORK=${CELO_NETWORK:-alfajores}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - rfd_network
+
+  # Frontend React
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rfd_frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:${BACKEND_PORT:-8000}
+      - REACT_APP_CELO_NETWORK=${CELO_NETWORK:-alfajores}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - rfd_network
+
+  # IPFS Node (optionnel pour développement)
+  ipfs:
+    image: ipfs/kubo:latest
+    container_name: rfd_ipfs
+    ports:
+      - "4001:4001"  # P2P
+      - "5001:5001"  # API
+      - "8080:8080"  # Gateway
+    volumes:
+      - ipfs_data:/data/ipfs
+    networks:
+      - rfd_network
+
+volumes:
+  postgres_data:
+  ipfs_data:
+
+networks:
+  rfd_network:
+    driver: bridge
