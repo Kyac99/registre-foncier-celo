@@ -1,0 +1,37 @@
+{
+  "name": "registre-foncier-celo",
+  "version": "1.0.0",
+  "description": "Registre Foncier Décentralisé sur blockchain CELO",
+  "main": "index.js",
+  "scripts": {
+    "install:all": "npm install && cd frontend && npm install && cd ../blockchain && npm install",
+    "dev": "concurrently \"npm run backend:dev\" \"npm run frontend:dev\" \"npm run blockchain:node\"",
+    "backend:dev": "cd backend && python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000",
+    "frontend:dev": "cd frontend && npm start",
+    "blockchain:node": "cd blockchain && npx hardhat node",
+    "blockchain:deploy:testnet": "cd blockchain && npx hardhat run scripts/deploy.js --network alfajores",
+    "blockchain:deploy:mainnet": "cd blockchain && npx hardhat run scripts/deploy.js --network celo",
+    "db:setup": "cd database && python setup_database.py",
+    "db:migrate": "cd database && python migrate.py",
+    "test:contracts": "cd blockchain && npx hardhat test",
+    "test:backend": "cd backend && python -m pytest",
+    "test:frontend": "cd frontend && npm test",
+    "test:all": "npm run test:contracts && npm run test:backend && npm run test:frontend",
+    "build": "cd frontend && npm run build",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down"
+  },
+  "keywords": [
+    "blockchain",
+    "celo",
+    "land-registry",
+    "real-estate",
+    "decentralized",
+    "smart-contracts"
+  ],
+  "author": "Kyac99",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
