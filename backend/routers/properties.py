@@ -1,170 +1,122 @@
 """
 Routeur API pour la gestion des propriétés foncières
+Endpoints CRUD avec intégration blockchain et IPFS
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select, and_, or_, func
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field, validator
-from datetime import datetime
 import json
+from io import BytesIO
+import logging
 
 from config.database import get_database, cache_manager
-from models import Property, PropertyType, PropertyStatus, User, PropertySearch
-from middleware.auth import verify_token, get_current_user
-from services.blockchain import CeloBlockchainService
-from services.ipfs import IPFSService
+from models.property import Property, PropertyType, PropertyStatus, PropertySearch
+from models.user import User, UserRole
+from services.blockchain_service import blockchain_service
+from services.ipfs_service import ipfs_service
+from middleware.auth import get_current_user, require_role
+from schemas.property import (
+    PropertyCreate, PropertyUpdate, PropertyResponse, 
+    PropertyListResponse, PropertySearchParams
+)
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# Schémas Pydantic pour la validation
-class PropertyCreate(BaseModel):
-    """Schéma pour créer une propriété"""
-    location: str = Field(..., min_length=5, max_length=500)
-    coordinates: Optional[Dict[str, Any]] = None  # GeoJSON
-    area: float = Field(..., gt=0)
-    value: Optional[float] = Field(None, ge=0)
-    property_type: PropertyType = PropertyType.RESIDENTIAL
-    document_file: Optional[str] = None  # Base64 ou référence fichier
-    
-    @validator('coordinates')
-    def validate_coordinates(cls, v):
-        if v is not None:
-            # Validation basique du GeoJSON
-            if not isinstance(v, dict) or 'type' not in v or 'coordinates' not in v:
-                raise ValueError("Format GeoJSON invalide")
-            if v['type'] not in ['Polygon', 'Point']:
-                raise ValueError("Type de géométrie non supporté")
-        return v
-
-class PropertyUpdate(BaseModel):
-    """Schéma pour mettre à jour une propriété"""
-    location: Optional[str] = Field(None, min_length=5, max_length=500)
-    coordinates: Optional[Dict[str, Any]] = None
-    area: Optional[float] = Field(None, gt=0)
-    value: Optional[float] = Field(None, ge=0)
-    property_type: Optional[PropertyType] = None
-    status: Optional[PropertyStatus] = None
-
-class PropertyFilter(BaseModel):
-    """Schéma pour filtrer les propriétés"""
-    property_type: Optional[PropertyType] = None
-    status: Optional[PropertyStatus] = None
-    min_area: Optional[float] = Field(None, ge=0)
-    max_area: Optional[float] = Field(None, ge=0)
-    min_value: Optional[float] = Field(None, ge=0)
-    max_value: Optional[float] = Field(None, ge=0)
-    owner_address: Optional[str] = None
-    verified_only: Optional[bool] = False
-    location_search: Optional[str] = None
-
-class PropertyResponse(BaseModel):
-    """Schéma de réponse pour une propriété"""
-    id: int
-    blockchain_id: int
-    owner_address: str
-    location: str
-    area: float
-    area_formatted: str
-    value: Optional[float]
-    value_formatted: str
-    property_type: str
-    type_display: str
-    status: str
-    status_display: str
-    is_verified: bool
-    registration_date: Optional[datetime]
-    last_transfer_date: Optional[datetime]
-    created_at: datetime
-    coordinates: Optional[Dict[str, Any]] = None
-
-# Services injectés
-async def get_blockchain_service() -> CeloBlockchainService:
-    return CeloBlockchainService()
-
-async def get_ipfs_service() -> IPFSService:
-    return IPFSService()
-
-# Endpoints
 
 @router.post("/", response_model=PropertyResponse, status_code=status.HTTP_201_CREATED)
 async def create_property(
-    property_data: PropertyCreate,
+    location: str = Form(...),
+    coordinates: str = Form(...),
+    area: float = Form(...),
+    value: float = Form(...),
+    property_type: str = Form(...),
+    owner_address: str = Form(...),
+    document: UploadFile = File(...),
     db: AsyncSession = Depends(get_database),
-    current_user: User = Depends(get_current_user),
-    blockchain_service: CeloBlockchainService = Depends(get_blockchain_service),
-    ipfs_service: IPFSService = Depends(get_ipfs_service)
+    current_user: User = Depends(require_role([UserRole.NOTARY, UserRole.ADMIN]))
 ):
     """
     Enregistre une nouvelle propriété sur la blockchain et en base de données
-    Nécessite le rôle notaire
+    Nécessite le rôle NOTARY ou ADMIN
     """
-    # Vérification des permissions
-    if not current_user.is_notary and not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Seuls les notaires peuvent enregistrer des propriétés"
-        )
-    
     try:
-        # Vérification si la localisation existe déjà
-        existing_query = select(Property).where(Property.location == property_data.location)
-        existing = await db.execute(existing_query)
+        logger.info(f"🏠 Création propriété par {current_user.wallet_address}")
+        
+        # Validation des données
+        if not PropertyType.__members__.get(property_type.upper()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Type de propriété invalide: {property_type}"
+            )
+        
+        # Vérification que la propriété n'existe pas déjà
+        existing = await db.execute(
+            select(Property).where(Property.location == location)
+        )
         if existing.scalar_one_or_none():
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Une propriété existe déjà à cette localisation"
             )
         
-        # Upload du document principal sur IPFS si fourni
-        document_hash = None
-        ipfs_hash = None
-        if property_data.document_file:
-            ipfs_result = await ipfs_service.upload_document(
-                property_data.document_file,
-                f"property_{property_data.location.replace(' ', '_')}.pdf"
-            )
-            document_hash = ipfs_result["hash"]
-            ipfs_hash = ipfs_result["hash"]
-        
-        # Conversion des coordonnées GeoJSON vers PostGIS
-        coordinates_wkt = None
-        if property_data.coordinates:
-            from services.geospatial import GeospatialService
-            geo_service = GeospatialService()
-            coordinates_wkt = geo_service.geojson_to_wkt(property_data.coordinates)
-        
-        # Enregistrement sur la blockchain CELO
-        tx_result = await blockchain_service.register_property(
-            owner_address=current_user.wallet_address,
-            location=property_data.location,
-            coordinates=json.dumps(property_data.coordinates) if property_data.coordinates else "",
-            area=int(property_data.area),
-            value=int(property_data.value * 10**18) if property_data.value else 0,  # Conversion en wei
-            property_type=property_data.property_type.value,
-            document_hash=document_hash or "",
-            registrar_address=current_user.wallet_address
+        # Upload du document sur IPFS
+        document_content = await document.read()
+        ipfs_result = await ipfs_service.upload_file(
+            file_content=document_content,
+            filename=document.filename,
+            metadata={
+                "property_location": location,
+                "uploaded_by": current_user.wallet_address,
+                "document_type": "property_deed"
+            },
+            encrypt=True  # Chiffrement pour les documents sensibles
         )
         
-        # Création de l'enregistrement en base de données
+        if not ipfs_result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Erreur upload document: {ipfs_result.get('error')}"
+            )
+        
+        # Conversion de la valeur en Wei (cUSD)
+        value_wei = int(value * 10**18)
+        
+        # Enregistrement sur la blockchain
+        blockchain_result = await blockchain_service.register_property(
+            owner_address=owner_address,
+            location=location,
+            coordinates=coordinates,
+            area=int(area),
+            value=value_wei,
+            property_type=PropertyType[property_type.upper()].value,
+            document_hash=ipfs_result["ipfs_hash"],
+            token_uri=f"{ipfs_result['gateway_url']}/metadata.json"
+        )
+        
+        if not blockchain_result["success"]:
+            # Nettoyer IPFS en cas d'échec blockchain
+            await ipfs_service.unpin_file(ipfs_result["ipfs_hash"])
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Erreur blockchain: {blockchain_result.get('error')}"
+            )
+        
+        # Sauvegarde en base de données
         new_property = Property(
-            blockchain_id=tx_result["property_id"],
-            owner_address=current_user.wallet_address,
-            location=property_data.location,
-            coordinates=coordinates_wkt,
-            area=property_data.area,
-            value=property_data.value,
-            property_type=property_data.property_type,
+            blockchain_id=blockchain_result["property_id"],
+            owner_address=owner_address,
+            location=location,
+            coordinates=f"POLYGON(({coordinates}))",  # Conversion en PostGIS
+            area=area,
+            value=value_wei,
+            property_type=property_type.upper(),
             status=PropertyStatus.ACTIVE,
-            registration_date=datetime.utcnow(),
-            last_transfer_date=datetime.utcnow(),
-            document_hash=document_hash,
-            ipfs_hash=ipfs_hash,
-            registrar_address=current_user.wallet_address,
-            is_verified=False
+            document_hash=ipfs_result["ipfs_hash"],
+            ipfs_hash=ipfs_result["ipfs_hash"],
+            registrar_address=current_user.wallet_address
         )
         
         db.add(new_property)
@@ -174,79 +126,81 @@ async def create_property(
         # Invalidation du cache
         await cache_manager.clear_pattern("properties:*")
         
-        return PropertyResponse(**new_property.to_dict(include_geom=True))
+        logger.info(f"✅ Propriété créée - ID: {new_property.id}, Blockchain ID: {blockchain_result['property_id']}")
         
+        return PropertyResponse(**new_property.to_dict())
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Erreur création propriété: {e}")
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur lors de l'enregistrement: {str(e)}"
+            detail="Erreur interne lors de la création de la propriété"
         )
 
-@router.get("/", response_model=List[PropertyResponse])
+@router.get("/", response_model=PropertyListResponse)
 async def list_properties(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    property_filter: PropertyFilter = Depends(),
+    property_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    owner_address: Optional[str] = Query(None),
+    verified_only: bool = Query(False),
     db: AsyncSession = Depends(get_database)
 ):
     """
     Liste les propriétés avec filtres et pagination
     """
-    cache_key = f"properties:list:{skip}:{limit}:{hash(str(property_filter.dict()))}"
-    
-    # Vérification du cache
-    cached_result = await cache_manager.get(cache_key)
-    if cached_result:
-        return cached_result
-    
-    # Construction de la requête
-    query = select(Property).options(selectinload(Property.owner))
-    
-    # Application des filtres
-    if property_filter.property_type:
-        query = query.where(Property.property_type == property_filter.property_type)
-    
-    if property_filter.status:
-        query = query.where(Property.status == property_filter.status)
-    
-    if property_filter.min_area is not None:
-        query = query.where(Property.area >= property_filter.min_area)
-    
-    if property_filter.max_area is not None:
-        query = query.where(Property.area <= property_filter.max_area)
-    
-    if property_filter.min_value is not None:
-        query = query.where(Property.value >= property_filter.min_value)
-    
-    if property_filter.max_value is not None:
-        query = query.where(Property.value <= property_filter.max_value)
-    
-    if property_filter.owner_address:
-        query = query.where(Property.owner_address == property_filter.owner_address)
-    
-    if property_filter.verified_only:
-        query = query.where(Property.is_verified == True)
-    
-    if property_filter.location_search:
-        # Recherche full-text sur la localisation
-        search_term = f"%{property_filter.location_search}%"
-        query = query.where(Property.location.ilike(search_term))
-    
-    # Pagination et tri
-    query = query.order_by(Property.created_at.desc()).offset(skip).limit(limit)
-    
-    # Exécution de la requête
-    result = await db.execute(query)
-    properties = result.scalars().all()
-    
-    # Conversion en réponse
-    response_data = [PropertyResponse(**prop.to_dict(include_geom=True)) for prop in properties]
-    
-    # Mise en cache
-    await cache_manager.set(cache_key, response_data, ttl=300)  # 5 minutes
-    
-    return response_data
+    try:
+        # Construction de la requête avec filtres
+        query = select(Property)
+        conditions = []
+        
+        if property_type:
+            conditions.append(Property.property_type == property_type.upper())
+        
+        if status:
+            conditions.append(Property.status == status.upper())
+        
+        if owner_address:
+            conditions.append(Property.owner_address == owner_address.lower())
+        
+        if verified_only:
+            conditions.append(Property.is_verified == True)
+        
+        if conditions:
+            query = query.where(and_(*conditions))
+        
+        # Ajout pagination
+        query = query.offset(skip).limit(limit).order_by(Property.created_at.desc())
+        
+        # Exécution
+        result = await db.execute(query)
+        properties = result.scalars().all()
+        
+        # Comptage total
+        count_query = select(func.count(Property.id))
+        if conditions:
+            count_query = count_query.where(and_(*conditions))
+        
+        total_result = await db.execute(count_query)
+        total = total_result.scalar()
+        
+        return PropertyListResponse(
+            properties=[PropertyResponse(**prop.to_dict()) for prop in properties],
+            total=total,
+            skip=skip,
+            limit=limit
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur liste propriétés: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la récupération des propriétés"
+        )
 
 @router.get("/{property_id}", response_model=PropertyResponse)
 async def get_property(
@@ -256,269 +210,324 @@ async def get_property(
     """
     Récupère une propriété par son ID
     """
-    cache_key = f"property:{property_id}"
-    
-    # Vérification du cache
-    cached_result = await cache_manager.get(cache_key)
-    if cached_result:
-        return cached_result
-    
-    # Requête en base
-    query = select(Property).options(
-        selectinload(Property.owner),
-        selectinload(Property.documents),
-        selectinload(Property.transactions)
-    ).where(Property.id == property_id)
-    
-    result = await db.execute(query)
-    property_obj = result.scalar_one_or_none()
-    
-    if not property_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Propriété non trouvée"
-        )
-    
-    response_data = PropertyResponse(**property_obj.to_dict(include_geom=True))
-    
-    # Mise en cache
-    await cache_manager.set(cache_key, response_data, ttl=600)  # 10 minutes
-    
-    return response_data
-
-@router.get("/{property_id}/geojson")
-async def get_property_geojson(
-    property_id: int,
-    db: AsyncSession = Depends(get_database)
-):
-    """
-    Récupère une propriété au format GeoJSON
-    """
-    query = select(Property).where(Property.id == property_id)
-    result = await db.execute(query)
-    property_obj = result.scalar_one_or_none()
-    
-    if not property_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Propriété non trouvée"
-        )
-    
-    return property_obj.to_geojson_feature()
-
-@router.get("/map/bounds")
-async def get_properties_in_bounds(
-    north: float = Query(..., ge=-90, le=90),
-    south: float = Query(..., ge=-90, le=90),
-    east: float = Query(..., ge=-180, le=180),
-    west: float = Query(..., ge=-180, le=180),
-    db: AsyncSession = Depends(get_database)
-):
-    """
-    Récupère les propriétés dans une zone géographique donnée
-    Format: GeoJSON FeatureCollection
-    """
-    # Construction de la requête géospatiale avec PostGIS
-    bbox_query = f"ST_MakeEnvelope({west}, {south}, {east}, {north}, 4326)"
-    
-    query = select(Property).where(
-        func.ST_Intersects(
-            Property.coordinates,
-            func.ST_GeomFromText(bbox_query)
-        )
-    ).limit(1000)  # Limite pour les performances
-    
-    result = await db.execute(query)
-    properties = result.scalars().all()
-    
-    # Construction de la FeatureCollection GeoJSON
-    features = [prop.to_geojson_feature() for prop in properties if prop.coordinates]
-    
-    return {
-        "type": "FeatureCollection",
-        "features": features,
-        "properties": {
-            "count": len(features),
-            "bounds": {
-                "north": north,
-                "south": south,
-                "east": east,
-                "west": west
-            }
-        }
-    }
-
-@router.patch("/{property_id}", response_model=PropertyResponse)
-async def update_property(
-    property_id: int,
-    property_update: PropertyUpdate,
-    db: AsyncSession = Depends(get_database),
-    current_user: User = Depends(get_current_user),
-    blockchain_service: CeloBlockchainService = Depends(get_blockchain_service)
-):
-    """
-    Met à jour une propriété
-    Nécessite d'être propriétaire ou notaire
-    """
-    # Récupération de la propriété
-    query = select(Property).where(Property.id == property_id)
-    result = await db.execute(query)
-    property_obj = result.scalar_one_or_none()
-    
-    if not property_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Propriété non trouvée"
-        )
-    
-    # Vérification des permissions
-    if not (current_user.wallet_address == property_obj.owner_address or 
-            current_user.is_notary or current_user.is_admin):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Vous n'êtes pas autorisé à modifier cette propriété"
-        )
-    
     try:
-        # Mise à jour des champs
-        update_data = property_update.dict(exclude_unset=True)
+        # Vérification cache
+        cache_key = f"property:{property_id}"
+        cached = await cache_manager.get(cache_key)
+        if cached:
+            return PropertyResponse(**cached)
         
-        for field, value in update_data.items():
-            if field == "coordinates" and value:
-                # Conversion GeoJSON vers PostGIS
-                from services.geospatial import GeospatialService
-                geo_service = GeospatialService()
-                coordinates_wkt = geo_service.geojson_to_wkt(value)
-                setattr(property_obj, field, coordinates_wkt)
-            else:
-                setattr(property_obj, field, value)
+        # Requête base de données
+        result = await db.execute(
+            select(Property).where(Property.id == property_id)
+        )
+        property_obj = result.scalar_one_or_none()
         
-        # Mise à jour sur la blockchain si nécessaire
-        if "value" in update_data and current_user.is_admin:
-            await blockchain_service.update_property_value(
-                property_obj.blockchain_id,
-                int(update_data["value"] * 10**18)  # Conversion en wei
+        if not property_obj:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Propriété non trouvée"
             )
+        
+        # Mise en cache
+        property_data = property_obj.to_dict()
+        await cache_manager.set(cache_key, property_data, ttl=300)  # 5 minutes
+        
+        return PropertyResponse(**property_data)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération propriété {property_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la récupération de la propriété"
+        )
+
+@router.put("/{property_id}/verify", response_model=PropertyResponse)
+async def verify_property(
+    property_id: int,
+    verified: bool = Form(True),
+    db: AsyncSession = Depends(get_database),
+    current_user: User = Depends(require_role([UserRole.SURVEYOR, UserRole.ADMIN]))
+):
+    """
+    Vérifie ou annule la vérification d'une propriété
+    Nécessite le rôle SURVEYOR ou ADMIN
+    """
+    try:
+        # Récupération de la propriété
+        result = await db.execute(
+            select(Property).where(Property.id == property_id)
+        )
+        property_obj = result.scalar_one_or_none()
+        
+        if not property_obj:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Propriété non trouvée"
+            )
+        
+        # Mise à jour de la vérification
+        property_obj.is_verified = verified
+        property_obj.verified_by = current_user.wallet_address if verified else None
+        property_obj.verification_date = func.now() if verified else None
+        
+        # Interaction blockchain si nécessaire
+        if hasattr(blockchain_service.contract, 'functions') and blockchain_service.contract:
+            try:
+                await blockchain_service.verify_property(
+                    property_obj.blockchain_id,
+                    verified
+                )
+            except Exception as e:
+                logger.warning(f"Erreur vérification blockchain: {e}")
         
         await db.commit()
         await db.refresh(property_obj)
         
-        # Invalidation du cache
+        # Invalidation cache
         await cache_manager.delete(f"property:{property_id}")
         await cache_manager.clear_pattern("properties:*")
         
-        return PropertyResponse(**property_obj.to_dict(include_geom=True))
+        action = "vérifiée" if verified else "non-vérifiée"
+        logger.info(f"✅ Propriété {property_id} {action} par {current_user.wallet_address}")
         
+        return PropertyResponse(**property_obj.to_dict())
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Erreur vérification propriété {property_id}: {e}")
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur lors de la mise à jour: {str(e)}"
+            detail="Erreur lors de la vérification"
         )
 
-@router.post("/{property_id}/verify")
-async def verify_property(
+@router.get("/{property_id}/document")
+async def download_property_document(
     property_id: int,
-    verification_note: Optional[str] = None,
     db: AsyncSession = Depends(get_database),
-    current_user: User = Depends(get_current_user),
-    blockchain_service: CeloBlockchainService = Depends(get_blockchain_service)
+    current_user: User = Depends(get_current_user)
 ):
     """
-    Vérifie une propriété (géomètre uniquement)
+    Télécharge le document associé à une propriété
     """
-    if not current_user.is_surveyor and not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Seuls les géomètres peuvent vérifier les propriétés"
-        )
-    
-    # Récupération de la propriété
-    query = select(Property).where(Property.id == property_id)
-    result = await db.execute(query)
-    property_obj = result.scalar_one_or_none()
-    
-    if not property_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Propriété non trouvée"
-        )
-    
     try:
-        # Vérification sur la blockchain
-        await blockchain_service.verify_property(
-            property_obj.blockchain_id,
-            True
+        # Récupération de la propriété
+        result = await db.execute(
+            select(Property).where(Property.id == property_id)
+        )
+        property_obj = result.scalar_one_or_none()
+        
+        if not property_obj:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Propriété non trouvée"
+            )
+        
+        if not property_obj.ipfs_hash:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Aucun document associé à cette propriété"
+            )
+        
+        # Vérification des droits d'accès
+        if (current_user.wallet_address != property_obj.owner_address and 
+            current_user.role not in [UserRole.NOTARY, UserRole.ADMIN, UserRole.SURVEYOR]):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Accès non autorisé à ce document"
+            )
+        
+        # Téléchargement depuis IPFS
+        download_result = await ipfs_service.download_file(
+            property_obj.ipfs_hash,
+            decrypt=True  # Les documents sont chiffrés
         )
         
-        # Mise à jour en base
-        property_obj.is_verified = True
-        await db.commit()
+        if not download_result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Erreur lors du téléchargement du document"
+            )
         
-        # Invalidation du cache
-        await cache_manager.delete(f"property:{property_id}")
+        # Préparation de la réponse streaming
+        file_content = download_result["content"]
+        file_stream = BytesIO(file_content)
         
-        return {"message": "Propriété vérifiée avec succès"}
+        # Détermination du type de contenu
+        metadata = download_result.get("metadata", {})
+        filename = metadata.get("keyvalues", {}).get("filename", f"document_{property_id}")
+        mime_type = metadata.get("keyvalues", {}).get("mimetype", "application/octet-stream")
         
+        return StreamingResponse(
+            BytesIO(file_content),
+            media_type=mime_type,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            }
+        )
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        await db.rollback()
+        logger.error(f"❌ Erreur téléchargement document {property_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur lors de la vérification: {str(e)}"
+            detail="Erreur lors du téléchargement"
         )
 
-@router.get("/stats/overview")
-async def get_properties_stats(
+@router.get("/search/geospatial")
+async def search_properties_by_location(
+    latitude: float = Query(...),
+    longitude: float = Query(...),
+    radius_km: float = Query(1.0, ge=0.1, le=50),
     db: AsyncSession = Depends(get_database)
 ):
     """
-    Récupère les statistiques générales des propriétés
+    Recherche géospatiale de propriétés dans un rayon donné
     """
-    cache_key = "properties:stats:overview"
-    
-    # Vérification du cache
-    cached_result = await cache_manager.get(cache_key)
-    if cached_result:
-        return cached_result
-    
-    # Requêtes de statistiques
-    total_query = select(func.count(Property.id))
-    verified_query = select(func.count(Property.id)).where(Property.is_verified == True)
-    total_area_query = select(func.sum(Property.area))
-    total_value_query = select(func.sum(Property.value))
-    
-    # Types de propriétés
-    types_query = select(
-        Property.property_type,
-        func.count(Property.id).label('count')
-    ).group_by(Property.property_type)
-    
-    # Exécution des requêtes
-    total_result = await db.execute(total_query)
-    verified_result = await db.execute(verified_query)
-    area_result = await db.execute(total_area_query)
-    value_result = await db.execute(total_value_query)
-    types_result = await db.execute(types_query)
-    
-    total_properties = total_result.scalar() or 0
-    verified_properties = verified_result.scalar() or 0
-    total_area = area_result.scalar() or 0
-    total_value = value_result.scalar() or 0
-    types_data = {row.property_type: row.count for row in types_result}
-    
-    stats = {
-        "total_properties": total_properties,
-        "verified_properties": verified_properties,
-        "verification_rate": (verified_properties / total_properties * 100) if total_properties > 0 else 0,
-        "total_area": float(total_area),
-        "total_area_formatted": f"{float(total_area):,.2f} m²",
-        "total_value": float(total_value) if total_value else 0,
-        "total_value_formatted": f"{float(total_value):,.2f} cUSD" if total_value else "0 cUSD",
-        "average_property_size": float(total_area / total_properties) if total_properties > 0 else 0,
-        "types_distribution": types_data
-    }
-    
-    # Mise en cache
-    await cache_manager.set(cache_key, stats, ttl=1800)  # 30 minutes
-    
-    return stats
+    try:
+        # Conversion du rayon en mètres
+        radius_meters = radius_km * 1000
+        
+        # Requête PostGIS pour recherche géospatiale
+        query = f"""
+            SELECT p.*, 
+                   ST_Distance(
+                       ST_GeomFromText('POINT({longitude} {latitude})', 4326)::geography,
+                       p.coordinates::geography
+                   ) as distance
+            FROM properties p
+            WHERE ST_DWithin(
+                p.coordinates::geography,
+                ST_GeomFromText('POINT({longitude} {latitude})', 4326)::geography,
+                {radius_meters}
+            )
+            ORDER BY distance
+            LIMIT 50
+        """
+        
+        result = await db.execute(query)
+        rows = result.fetchall()
+        
+        # Formatage des résultats
+        properties = []
+        for row in rows:
+            prop_data = {
+                "id": row.id,
+                "blockchain_id": row.blockchain_id,
+                "owner_address": row.owner_address,
+                "location": row.location,
+                "area": float(row.area),
+                "value": float(row.value) / 10**18 if row.value else 0,
+                "property_type": row.property_type,
+                "status": row.status,
+                "is_verified": row.is_verified,
+                "distance_km": round(row.distance / 1000, 2)
+            }
+            properties.append(prop_data)
+        
+        return {
+            "properties": properties,
+            "search_center": {"latitude": latitude, "longitude": longitude},
+            "radius_km": radius_km,
+            "total_found": len(properties)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur recherche géospatiale: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la recherche géospatiale"
+        )
+
+@router.get("/owner/{owner_address}", response_model=PropertyListResponse)
+async def get_properties_by_owner(
+    owner_address: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Récupère toutes les propriétés d'un propriétaire
+    """
+    try:
+        # Requête avec pagination
+        query = select(Property).where(
+            Property.owner_address == owner_address.lower()
+        ).offset(skip).limit(limit).order_by(Property.created_at.desc())
+        
+        result = await db.execute(query)
+        properties = result.scalars().all()
+        
+        # Comptage total
+        count_result = await db.execute(
+            select(func.count(Property.id)).where(
+                Property.owner_address == owner_address.lower()
+            )
+        )
+        total = count_result.scalar()
+        
+        return PropertyListResponse(
+            properties=[PropertyResponse(**prop.to_dict()) for prop in properties],
+            total=total,
+            skip=skip,
+            limit=limit
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur propriétés owner {owner_address}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la récupération des propriétés"
+        )
+
+@router.get("/stats/summary")
+async def get_property_stats(
+    db: AsyncSession = Depends(get_database)
+):
+    """
+    Statistiques générales sur les propriétés
+    """
+    try:
+        # Requêtes statistiques
+        stats_query = """
+            SELECT 
+                COUNT(*) as total_properties,
+                COUNT(CASE WHEN is_verified = true THEN 1 END) as verified_properties,
+                COUNT(DISTINCT owner_address) as unique_owners,
+                SUM(area) as total_area,
+                AVG(area) as average_area,
+                COUNT(CASE WHEN property_type = 'RESIDENTIAL' THEN 1 END) as residential,
+                COUNT(CASE WHEN property_type = 'COMMERCIAL' THEN 1 END) as commercial,
+                COUNT(CASE WHEN property_type = 'AGRICULTURAL' THEN 1 END) as agricultural,
+                COUNT(CASE WHEN property_type = 'INDUSTRIAL' THEN 1 END) as industrial
+            FROM properties
+        """
+        
+        result = await db.execute(stats_query)
+        stats = result.fetchone()
+        
+        return {
+            "total_properties": stats.total_properties,
+            "verified_properties": stats.verified_properties,
+            "unique_owners": stats.unique_owners,
+            "total_area": float(stats.total_area) if stats.total_area else 0,
+            "average_area": float(stats.average_area) if stats.average_area else 0,
+            "by_type": {
+                "residential": stats.residential,
+                "commercial": stats.commercial,
+                "agricultural": stats.agricultural,
+                "industrial": stats.industrial
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur stats propriétés: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors du calcul des statistiques"
+        )
