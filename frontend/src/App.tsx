@@ -9,12 +9,14 @@ import 'leaflet/dist/leaflet.css';
 import Layout from './components/Layout';
 import HomePage from './pages/HomePage';
 import PropertiesPage from './pages/PropertiesPage';
-import PropertyDetailsPage from './pages/PropertyDetailsPage';
-import RegisterPropertyPage from './pages/RegisterPropertyPage';
-import SearchPage from './pages/SearchPage';
-import MapPage from './pages/MapPage';
-import ProfilePage from './pages/ProfilePage';
-import DashboardPage from './pages/DashboardPage';
+import { 
+  PropertyDetailsPage, 
+  RegisterPropertyPage, 
+  SearchPage, 
+  MapPage, 
+  ProfilePage, 
+  DashboardPage 
+} from './pages';
 
 // Providers
 import { Web3Provider } from './contexts/Web3Context';
